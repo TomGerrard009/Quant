@@ -1,5 +1,5 @@
 # Quant
-All quant related coding projects, open to improvements from communities.
+# All quant related coding projects, open to improvements from communities.
 
 ### Commands to be used throughout
 %config InlineBackend.figure_format = 'retina'
