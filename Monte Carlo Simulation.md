@@ -1,7 +1,7 @@
 # Quant
 All quant related coding projects, open to improvements from communities.
 
-# Commands to be used throughout
+### Commands to be used throughout
 %config InlineBackend.figure_format = 'retina'
 %matplotlib inline
 
@@ -15,7 +15,7 @@ from scipy.optimize import minimize
 
 plt.rcParams.update({'font.size':14})
 
-# ------- MONTE CARLO SIM FOR 3-ASSET PORTFOLIO ------------- #
+## ------- MONTE CARLO SIM FOR 3-ASSET PORTFOLIO ------------- #
 n_assets = 3  
 
 tickers = ["AAPL", "TSLA", "NVDA"]  #example tickers
@@ -26,28 +26,28 @@ def pricing(symbol):
     last = ticker.history(period="1d")
     return last['Close'].iloc[-1]
 
-# Defining parameters
+### Defining parameters
 T = 1 # time in years
 N = 252 # trading days
 dt = T/N # timestamp of steps 
 M = 10000 # no of simulations
 
 
-# Log returns of prices 
+### Log returns of prices 
 log_ret = np.log(prices / prices.shift(1)).dropna()  
 
-# Drift (mu) and volatility (sigma) annualised
+### Drift (mu) and volatility (sigma) annualised
 mu = np.array(log_ret.mean() * 252)   
 sigma = np.array(log_ret.std() * np.sqrt(252))          
 
-# Portfolio weights (sum to 1)          # random weights for simulation and then optimise weightings.
+### Portfolio weights (sum to 1)          ### random weights for simulation and then optimise weightings.
 weights = np.array([0.35, 0.37, 0.28])
 
 
-# Correlation matrix
+### Correlation matrix
 corr_matrix = log_ret.corr()
 
-# Covariance Matrix calculated using Cholesky decomposition
+### Covariance Matrix calculated using Cholesky decomposition
 D = np.diag(sigma)
 cov_matrix = D @ corr_matrix @ D    
 L = np.linalg.cholesky(cov_matrix) 
