@@ -15,7 +15,7 @@ from scipy.optimize import minimize
 
 plt.rcParams.update({'font.size':14})
 
-## ------- MONTE CARLO SIM FOR 3-ASSET PORTFOLIO ------------- #
+## ------- MONTE CARLO SIM FOR 3-ASSET PORTFOLIO ------------- 
 n_assets = 3  
 
 tickers = ["AAPL", "TSLA", "NVDA"]  #example tickers
@@ -40,8 +40,8 @@ log_ret = np.log(prices / prices.shift(1)).dropna()
 mu = np.array(log_ret.mean() * 252)   
 sigma = np.array(log_ret.std() * np.sqrt(252))          
 
-### Portfolio weights (sum to 1)          ### random weights for simulation and then optimise weightings.
-weights = np.array([0.35, 0.37, 0.28])
+### Portfolio weights (sum to 1)          
+weights = np.array([0.35, 0.37, 0.28])     # # random weights for simulation and then optimise weightings.
 
 
 ### Correlation matrix
@@ -56,14 +56,14 @@ print("L shape:", L.shape)
 print("log_ret shape:2", log_ret.shape)        # checks shapes to see if calculations have been carried out properly.
 
 
-# So is generated with real latest data
+### So is generated with real latest data
 S0 = np.array([pricing(t) for t in tickers])
 
-# --------- SIMULATING GBM PATHS ------------- #
+## --------- SIMULATING GBM PATHS ------------- #
 sim_paths = np.zeros((M, N+1, n_assets))
 sim_paths[:,0,:] = S0
 
-# Simulate GBM with correlated shocks
+### Simulate GBM with correlated shocks
 for m in range(M):
     Z = np.random.normal(size=(N, n_assets))
     corr = Z @ L.T
@@ -72,10 +72,10 @@ for m in range(M):
             (mu - 0.5 * sigma**2) * dt + np.sqrt(dt) * corr[t - 1]
         )
 
-# Compute weighted portfolio value per simulation & timestep
+### Compute weighted portfolio value per simulation & timestep
 port_val = np.sum(sim_paths * weights, axis=2)  # shape (M, N+1)
 
-# Scale portfolio so initial value = 100,000
+### Scale portfolio
 initial_port_val= np.sum(S0 * weights)
 scale_factor = 100000 / initial_port_val
 port_val *= scale_factor
@@ -83,11 +83,11 @@ port_val *= scale_factor
 final_values = port_val[:, -1]
 port_mean = np.mean(final_values)
 
-# ------------ PLOTTING RESULTS ---------------- #
-# Plotting side by side
+## ------------ PLOTTING RESULTS ---------------- #
+### Plotting side by side
 fig, axs = plt.subplots(1, 2, figsize=(16, 6))
 
-# ---- Left plot: Simulation paths ----
+### ---- Left plot: Simulation paths ----
 for i in range(10000):
     axs[0].plot(port_val[i])
 axs[0].set_title("Sample Simulated Portfolio Paths")
@@ -95,7 +95,7 @@ axs[0].set_xlabel("Time Step (Day)")
 axs[0].set_ylabel("Portfolio Value ($)")
 axs[0].grid(True)
 
-# Add portfolio weights and starting prices as text box
+### Add portfolio weights and starting prices as text box
 weights_percent = weights * 100
 textstr = '\n'.join((
     "Portfolio Weights & Starting Prices:",
@@ -105,28 +105,28 @@ props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
 axs[0].text(0.05, 0.95, textstr, transform=axs[0].transAxes, fontsize=10,
             verticalalignment='top', bbox=props)
 
-# ---- Right plot: Histogram of final portfolio values ----
+### ---- Right plot: Histogram of final portfolio values ----
 axs[1].hist(final_values, bins=50, edgecolor='black')
 axs[1].set_title("Distribution of Final Portfolio Values")
 axs[1].set_xlabel("Portfolio Value at T ($)")
 axs[1].set_ylabel("Frequency")
 axs[1].grid(True)
 
-# Compute VaR at 95% confidence
+### Compute VaR at 95% confidence
 VaR_95 = np.percentile(final_values, 5)
 
-# Plot VaR vertical line
+### Plot VaR vertical line
 axs[1].axvline(VaR_95, color='r', linestyle='--', label=f'VaR (5%): ${VaR_95:,.0f}')
 
-# Calculate % chance portfolio ends below initial 100k (loss)
+### Calculate % chance portfolio ends below initial 100k (loss)
 pct_loss = np.mean(final_values < 100000) * 100
 axs[1].axvline(100000, color='orange', linestyle='--', label='Initial Portfolio Value')
 axs[1].legend()
 
-# Add text box for VaR and loss %
+### Add text box for VaR and loss %
 textstr2 = f"Value at Risk (5% quantile): ${VaR_95:,.2f}\n" \
            f"Chance of Loss (below $100k): {pct_loss:.2f}%"
-# Add text box for VaR and loss % in top right, just above legend
+### Add text box for VaR and loss % in top right, just above legend
 axs[1].text(0.95, 0.95, textstr2, transform=axs[1].transAxes, fontsize=10,
             verticalalignment='top', horizontalalignment='right',
             bbox=props)
@@ -135,12 +135,12 @@ axs[1].text(0.95, 0.95, textstr2, transform=axs[1].transAxes, fontsize=10,
 plt.tight_layout()
 plt.show()
 
-# text box code used from k-dickinson, monte carlo simulation code as I love the clean look and the use of a VaR percentile as a risk measure.
+### text box code used from k-dickinson, monte carlo simulation code as I love the clean look and the use of a VaR percentile as a risk measure.
 
 print("Portfolio mean value: ${:.3f}".format(port_mean))
 print("Return: {:.3f}%".format(port_mean / 100000))
 
-# --------------- WEIGHT OPTIMISATION METHOD 1 (MAXIMISING SHARPE RATIO) ----------------- #
+## --------------- WEIGHT OPTIMISATION METHOD 1 (MAXIMISING SHARPE RATIO) ----------------- #
 returns = log_ret
 Rf = 4.08     # latest could be taken from T10 bonds
 
@@ -165,11 +165,11 @@ opt_result = minimize(negative_sharpe, init_guess,
 
 opt_weights = opt_result.x       # new optimal weightings
 
-# ---------------- NEW PLOTS AND SIMULATED PATHS WITH OPTIMAL WEIGHTINGS --------------- # 
+## ---------------- NEW PLOTS AND SIMULATED PATHS WITH OPTIMAL WEIGHTINGS --------------- # 
 sim_paths = np.zeros((M, N+1, n_assets))
 sim_paths[:,0,:] = S0
 
-# Simulate GBM with correlated shocks
+### Simulate GBM with correlated shocks
 for m in range(M):
     Z = np.random.normal(size=(N, n_assets))
     corr = Z @ L.T
@@ -178,10 +178,10 @@ for m in range(M):
             (mu - 0.5 * sigma**2) * dt + np.sqrt(dt) * corr[t - 1]
         )
 
-# Compute weighted portfolio value per simulation & timestep
+### Compute weighted portfolio value per simulation & timestep
 opt_port_val = np.sum(sim_paths * opt_weights, axis=2)  # shape (M, N+1)
 
-# Scale portfolio so initial value = 100,000
+### Scale portfolio so initial value = 100,000
 opt_initial_port_val= np.sum(S0 * opt_weights)
 opt_scale_factor = 100000 / opt_initial_port_val
 opt_port_val *= opt_scale_factor
@@ -189,10 +189,10 @@ opt_port_val *= opt_scale_factor
 opt_final_values = opt_port_val[:, -1]
 opt_port_mean = np.mean(opt_final_values)
 
-# Plotting side by side
+### Plotting side by side
 fig, axs = plt.subplots(1, 2, figsize=(16, 6))
 
-# ---- Left plot: Simulation paths ----
+### ---- Left plot: Simulation paths ----
 for i in range(10000):
     axs[0].plot(opt_port_val[i])
 axs[0].set_title("Sample Simulated Portfolio Paths")
@@ -200,7 +200,7 @@ axs[0].set_xlabel("Time Step (Day)")
 axs[0].set_ylabel("Portfolio Value ($)")
 axs[0].grid(True)
 
-# Add portfolio weights and starting prices as text box
+### Add portfolio weights and starting prices as text box
 opt_weights_percent = opt_weights * 100
 textstr = '\n'.join((
     "Portfolio Weights & Starting Prices:",
@@ -210,28 +210,28 @@ props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
 axs[0].text(0.05, 0.95, textstr, transform=axs[0].transAxes, fontsize=10,
             verticalalignment='top', bbox=props)
 
-# ---- Right plot: Histogram of final portfolio values ----
+### ---- Right plot: Histogram of final portfolio values ----
 axs[1].hist(opt_final_values, bins=50, edgecolor='black')
 axs[1].set_title("Distribution of Final Optimal Portfolio Values")
 axs[1].set_xlabel("Portfolio Value at T ($)")
 axs[1].set_ylabel("Frequency")
 axs[1].grid(True)
 
-# Compute VaR at 95% confidence
+### Compute VaR at 95% confidence
 opt_VaR_95 = np.percentile(opt_final_values, 5)
 
-# Plot VaR vertical line
+### Plot VaR vertical line
 axs[1].axvline(opt_VaR_95, color='r', linestyle='--', label=f'VaR (5%): ${opt_VaR_95:,.0f}')
 
-# Calculate % chance portfolio ends below initial 100k (loss)
+### Calculate % chance portfolio ends below initial 100k (loss)
 opt_pct_loss = np.mean(opt_final_values < 100000) * 100
 axs[1].axvline(100000, color='orange', linestyle='--', label='Initial Portfolio Value')
 axs[1].legend()
 
-# Add text box for VaR and loss %
+### Add text box for VaR and loss %
 textstr2 = f"Value at Risk (5% quantile): ${opt_VaR_95:,.2f}\n" \
            f"Chance of Loss (below $100k): {opt_pct_loss:.2f}%"
-# Add text box for VaR and loss % in top right, just above legend
+### Add text box for VaR and loss % in top right, just above legend
 axs[1].text(0.95, 0.95, textstr2, transform=axs[1].transAxes, fontsize=10,
             verticalalignment='top', horizontalalignment='right',
             bbox=props)
@@ -245,13 +245,13 @@ print("Return: {:.3f}%".format(port_mean / 100000))
 print(opt_weights)
 
 
-# -------------- WEIGHT OPTIMISATION METHOD 2 (MAX RETURN PER UNIT RISK) -------------------- #
+## -------------- WEIGHT OPTIMISATION METHOD 2 (MAX RETURN PER UNIT RISK) -------------------- #
 def portfolio_performance(weights, mean_returns, cov_matrix):
     port_return = np.dot(weights, mean_returns)
     port_std = np.sqrt(weights.T @ cov_matrix @ weights)
     return port_return, port_std
 
-# Maximise return per unit risk
+### Maximise return per unit risk
 def negative_return_risk(weights, mean_returns, cov_matrix):
     port_return, port_std = portfolio_performance(weights, mean_returns, cov_matrix)
     return - (port_return / port_std)   # negative Sharpe-like ratio
@@ -278,11 +278,11 @@ print("Optimal Weights:", alt_weights.round(4))
 print(f"Expected Annual Return: {port_mean:.2%}")
 print(f"Annual Volatility (Risk): {alt_risk:.2%}")
 
-# ---------- NEW PLOTS AND SIMULATION WITH WEIGHTS ------------- #
+## ---------- NEW PLOTS AND SIMULATION WITH WEIGHTS ------------- #
 sim_paths = np.zeros((M, N+1, n_assets))
 sim_paths[:,0,:] = S0
 
-# Simulate GBM with correlated shocks
+### Simulate GBM with correlated shocks
 for m in range(M):
     Z = np.random.normal(size=(N, n_assets))
     corr = Z @ L.T
@@ -291,20 +291,20 @@ for m in range(M):
             (mu - 0.5 * sigma**2) * dt + np.sqrt(dt) * corr[t - 1]
         )
 
-# Compute weighted portfolio value per simulation & timestep
+### Compute weighted portfolio value per simulation & timestep
 alt_port_val = np.sum(sim_paths * alt_weights, axis=2)  # shape (M, N+1)
 
-# Scale portfolio so initial value = 100,000
+### Scale portfolio so initial value = 100,000
 alt_initial_port_val= np.sum(S0 * alt_weights)
 alt_scale_factor = 100000 / alt_initial_port_val
 alt_port_val *= alt_scale_factor
 
 alt_final_values = alt_port_val[:, -1]
 
-# Plotting side by side
+### Plotting side by side
 fig, axs = plt.subplots(1, 2, figsize=(16, 6))
 
-# ---- Left plot: Simulation paths ----
+### ---- Left plot: Simulation paths ----
 for i in range(10000):
     axs[0].plot(alt_port_val[i])
 axs[0].set_title("Sample Simulated Portfolio Paths")
@@ -312,7 +312,7 @@ axs[0].set_xlabel("Time Step (Day)")
 axs[0].set_ylabel("Portfolio Value ($)")
 axs[0].grid(True)
 
-# Add portfolio weights and starting prices as text box
+### Add portfolio weights and starting prices as text box
 alt_weights_percent = alt_weights * 100
 textstr = '\n'.join((
     "Portfolio Weights & Starting Prices:",
@@ -322,28 +322,28 @@ props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
 axs[0].text(0.05, 0.95, textstr, transform=axs[0].transAxes, fontsize=10,
             verticalalignment='top', bbox=props)
 
-# ---- Right plot: Histogram of final portfolio values ----
+### ---- Right plot: Histogram of final portfolio values ----
 axs[1].hist(alt_final_values, bins=50, edgecolor='black')
 axs[1].set_title("Distribution of Final Optimal Portfolio Values")
 axs[1].set_xlabel("Portfolio Value at T ($)")
 axs[1].set_ylabel("Frequency")
 axs[1].grid(True)
 
-# Compute VaR at 95% confidence
+### Compute VaR at 95% confidence
 alt_VaR_95 = np.percentile(alt_final_values, 5)
 
-# Plot VaR vertical line
+### Plot VaR vertical line
 axs[1].axvline(alt_VaR_95, color='r', linestyle='--', label=f'VaR (5%): ${alt_VaR_95:,.0f}')
 
-# Calculate % chance portfolio ends below initial 100k (loss)
+### Calculate % chance portfolio ends below initial 100k (loss)
 alt_pct_loss = np.mean(alt_final_values < 100000) * 100
 axs[1].axvline(100000, color='orange', linestyle='--', label='Initial Portfolio Value')
 axs[1].legend()
 
-# Add text box for VaR and loss %
+### Add text box for VaR and loss %
 textstr2 = f"Value at Risk (5% quantile): ${alt_VaR_95:,.2f}\n" \
            f"Chance of Loss (below $100k): {alt_pct_loss:.2f}%"
-# Add text box for VaR and loss % in top right, just above legend
+### Add text box for VaR and loss % in top right, just above legend
 axs[1].text(0.95, 0.95, textstr2, transform=axs[1].transAxes, fontsize=10,
             verticalalignment='top', horizontalalignment='right',
             bbox=props)
@@ -356,7 +356,7 @@ print("Portfolio mean value: ${:.3f}".format(port_mean))
 print("Return: {:.3f}%".format(port_mean / 100000))
 print(alt_weights)
 
-# -------- EVALUATION OF WEIGHT OPTIMISATION EFFECT ------------ #
+## -------- EVALUATION OF WEIGHT OPTIMISATION EFFECT ------------ #
 - Disappointing to see that both weight optimisation techniques made no effect at all to the returns, but both techniques produces a decrease in value at risk. Most effect at decreasing VaR (by ~$5000) at the 5% level was optimisation by maximising the sharpe ratio.
 - It is also important to consider that the number of simulations outweighs the effect of the optimisations applied, as new simulated paths may under/over perform and cause an unaltered mean as randomness still exists.
 - A possible improvement is adjusted the weight throughout the simulation so that it is theoretically, constantly optimal. However, in real markets, adjusting the weights so often would be unrealistic due to position size and most likely detrimental to profit because of transaction costs. This would also increase the runtime of the Monte Carlo simulation by an massive amount as the weight is being adjusted for 10,000 simulations 253 times.
