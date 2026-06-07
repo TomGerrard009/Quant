@@ -135,8 +135,6 @@ axs[1].text(0.95, 0.95, textstr2, transform=axs[1].transAxes, fontsize=10,
 plt.tight_layout()
 plt.show()
 
-### text box code used from k-dickinson, monte carlo simulation code as I love the clean look and the use of a VaR percentile as a risk measure.
-
 print("Portfolio mean value: ${:.3f}".format(port_mean))
 print("Return: {:.3f}%".format(port_mean / 100000))
 
