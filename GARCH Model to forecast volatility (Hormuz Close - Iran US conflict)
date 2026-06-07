@@ -1,0 +1,261 @@
+# useful packages
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.ticker as mtick
+
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+from pmdarima import auto_arima
+import scipy.stats as stats
+from scipy.optimize import minimize
+
+plt.rcParams.update({'font.size':14})
+%config InlineBackend.figure_format = 'retina'
+%matplotlib inline
+
+
+# --- Import TTF data ----
+TTF = pd.DataFrame(yf.download('TTF=F', period='1y', interval='1h', auto_adjust='True'))
+TTF = TTF.dropna()
+TTF['Av Price'] = (TTF['High'] + TTF['Low'] + TTF['Close'] + TTF['Open']) / 4
+TTF['Tomorrow'] = TTF['Close'].shift(-1)
+TTF['SMA21'] = TTF['Close'].rolling(window=21).mean()
+TTF['SMA50'] = TTF['Close'].rolling(window=50).mean()
+TTF['log_ret'] = np.log(TTF['Close'] / TTF['Close'].shift(1))
+TTF['log_ret'] = (TTF['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
+TTF['Rolling Daily Vol'] = TTF['log_ret'].rolling(window=20).std()
+TTF.dropna(subset=[('SMA21','')], inplace=True)
+TTF = TTF.drop(TTF.tail(51).index)
+
+Volume = TTF.iloc[:,4].values
+Sum = Volume.sum()
+Volume_norm = Volume/Sum
+
+# Using MLE for GARCH parameters
+def stationarity_constraint(params):
+    omega, alpha, beta = params
+    return 1 - alpha - beta
+
+def garch_neg_loglik(params, returns):
+    omega, alpha, beta = params
+    T = len(returns)
+    
+    sigma2 = np.zeros(T)
+    sigma2[0] = np.var(returns)
+
+    for t in range(1, T):
+        sigma2[t] = omega + alpha * returns[t-1]**2 + beta * sigma2[t-1]
+    
+    ll = -0.5 * np.sum(
+        np.log(2 * np.pi * sigma2) +
+        (returns**2) / sigma2
+    )
+    
+    return -ll
+
+
+initial_guess = [0.0, 0.5, 0.5]
+returns = np.array(TTF['log_ret'][-100:].values)
+
+result = minimize(
+    garch_neg_loglik,
+    initial_guess,
+    args=(returns,),
+    method="L-BFGS-B",
+    bounds=[(1e-8, None), (1e-8, 1), (1e-8, 1)],
+    constraints={'type': 'ineq', 'fun': lambda x: 1 - x[1] - x[2]}
+)
+
+omega_hat, alpha_hat, beta_hat = result.x
+
+alpha_hat = 0.35
+beta_hat  = 0.64998
+
+Close = TTF['Close', 'TTF=F'].values
+last_vol = (TTF['Rolling Daily Vol'][-1:].values)[0]
+
+np.random.seed(68)
+
+N = 21*6
+t = np.linspace(0, 1, N)
+T = 1
+dt = T/N
+asset = np.zeros(N)
+asset[0] = Close[-1]
+stnd_dev_65 = np.zeros(N)
+stnd_dev_65[0] = last_vol
+error = np.zeros(N)
+Z = np.random.standard_normal(N)
+error[0] = stnd_dev_65[0]*Z[0]
+returns_65 = np.zeros(N)
+returns_65[0] = TTF['log_ret'].iloc[-1] + 1
+
+lam0 = 0.01
+mu_J = 2
+sigma_J = 0.1
+# Bernoulli indicator
+    
+# Jump sizes
+Y = np.random.normal(mu_J, sigma_J, N)
+
+lam_t_series = np.zeros(N)
+I = np.zeros(N)
+jump = np.zeros(N)
+lam_t_series[0] = lam0
+
+kappa = 0.89   # decay of jump intensity (VERY important)
+eta = 0.15     # excitation strength
+
+for i in range(1, N):
+
+    # continuous shock
+    cont_shock = stnd_dev_65[i-1] * Z[i-1]
+    I[i] = np.random.binomial(1, lam_t_series[i])
+
+    # --- Hawkes-style intensity ---
+    lam_t_series[i] = (
+        lam0
+        + kappa * (lam_t_series[i-1] - lam0)
+        + eta * I[i-1]
+    )
+
+    lam_t_series[i] = min(lam_t_series[i], 1)
+
+    # variance update
+    stnd_dev_65[i] = np.sqrt(
+        omega_hat
+        + alpha_hat * cont_shock**2
+        + beta_hat * stnd_dev_65[i-1]**2
+    )
+
+    # jump
+    jump[i] = I[i] * Y[i]
+
+    returns_65[i] = stnd_dev_65[i] * Z[i] + jump[i]
+    asset[i] = asset[i-1] * np.exp(returns_65[i])
+
+# Plot volatility path and asset path
+datetime = pd.date_range(start='2026-03-01', periods=len(stnd_dev_65[2:]), freq='6h')
+
+fig, axs = plt.subplots(1, 2, figsize=(16, 6))
+axs[0].plot(datetime, stnd_dev_65[2:]*100)
+axs[0].set_title('J-GARCH Volatility Path')
+axs[0].set_xlabel('Time $(days)$')
+axs[0].tick_params(axis='x', labelrotation=45)
+axs[0].set_ylabel('Volatility %')
+
+axs[1].plot(datetime, Close[-1] + np.exp(returns_65[2:]))
+axs[1].set_title('J-GARCH Asset Path')
+axs[1].set_xlabel('Time $(days)$')
+axs[1].yaxis.set_major_formatter(mtick.FormatStrFormatter('%.2f'))
+axs[1].tick_params(axis='x', labelrotation=45)
+axs[1].set_ylabel('TTF Price ($)')
+
+plt.savefig('J-GARCH path - Gas 4')
+plt.tight_layout()
+plt.show()
+
+
+# In the further event of the closing of the straight of Hormuz
+alpha_hat = 0.35
+beta_hat  = 0.64998
+
+Close = TTF['Close', 'TTF=F'].values
+last_vol = (TTF['Rolling Daily Vol'][-1:].values)[0]
+
+np.random.seed(68)
+
+N = 21*6
+t = np.linspace(0, 1, N)
+T = 1
+dt = T/N
+asset = np.zeros(N)
+asset[0] = Close[-1]
+stnd_dev_68 = np.zeros(N)
+stnd_dev_68[0] = last_vol
+error = np.zeros(N)
+Z = np.random.standard_normal(N)
+error[0] = stnd_dev_68[0]*Z[0]
+returns_68 = np.zeros(N)
+returns_68[0] = TTF['log_ret'].iloc[-1] + 1
+
+lam0 = 0.1
+mu_J = 2
+sigma_J = 0.1
+# Bernoulli indicator
+    
+# Jump sizes
+Y = np.random.normal(mu_J, sigma_J, N)
+
+lam_t_series = np.zeros(N)
+jump = np.zeros(N)
+lam_t_series[0] = lam0
+
+kappa = 0.89   # decay of jump intensity (VERY important)
+eta = 0.15     # excitation strength
+
+for i in range(1, N):
+
+    # continuous shock
+    cont_shock = stnd_dev_68[i-1] * Z[i-1]
+
+    # --- Hawkes-style intensity ---
+    lam_t_series[i] = (
+        lam0
+        + kappa * (lam_t_series[i-1] - lam0)
+        + eta * I[i-1]
+    )
+
+    lam_t_series[i] = min(lam_t_series[i], 1)
+
+    I[i] = np.random.binomial(1, lam_t_series[i])
+
+    # variance update
+    stnd_dev_68[i] = np.sqrt(
+        omega_hat
+        + alpha_hat * cont_shock**2
+        + beta_hat * stnd_dev_68[i-1]**2
+    )
+
+    # jump
+    jump[i] = I[i] * Y[i]
+
+    returns_68[i] = stnd_dev_68[i] * Z[i] + jump[i]
+    asset[i] = asset[i-1] * np.exp(returns_68[i])
+
+# Plot added asset path and secondary volatility path onto original plots
+datetime = pd.date_range(start='2026-03-01', periods=len(stnd_dev_65[2:]), freq='6h')
+hormuz_ret = np.concatenate((returns_68[:69], 0.8 + returns_65[-57:]+returns_68[-57:]))
+jan_iran_ret = np.concatenate((Close[-305:], Close[-1] + np.exp(returns_68[2:])))
+jan_hormuz_ret = np.concatenate((Close[-305:], Close[-1] + np.exp(hormuz_ret[2:])))
+ddd = pd.date_range(start='2026-01-03', periods=len(jan_hormuz_ret), freq='3h')
+
+fig, axs = plt.subplots(1, 2, figsize=(16, 6))
+axs[0].plot(datetime, stnd_dev_68[2:]*100, label='Iran Conflict', color='blue')
+axs[0].plot(datetime, (stnd_dev_65[2:]+ stnd_dev_68[2:])*100, label='Hormuz Close', color='red')
+axs[0].set_title('J-GARCH Volatility Path')
+axs[0].set_xlabel('Time $(days)$')
+axs[0].tick_params(axis='x', labelrotation=45)
+axs[0].set_ylabel('Volatility %')
+axs[0].legend()
+
+axs[1].plot(datetime, Close[-1] + np.exp(hormuz_ret[2:]), label='Hormuz Close', color='red')
+axs[1].plot(datetime, Close[-1] + np.exp(returns_68[2:]), label='Iran Conflict', color='blue')
+axs[1].set_title('J-GARCH Asset Path')
+axs[1].set_xlabel('Time $(days)$')
+axs[1].yaxis.set_major_formatter(mtick.FormatStrFormatter('%.2f'))
+axs[1].tick_params(axis='x', labelrotation=45)
+axs[1].set_ylabel('TTF Price ($)')
+axs[1].legend()
+
+
+plt.tight_layout()
+plt.savefig('J-GARCH path - Combined')
+plt.show()
