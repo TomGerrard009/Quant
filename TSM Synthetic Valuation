@@ -1,0 +1,544 @@
+# useful packages used throughout the code
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import yfinance as yf
+from scipy.interpolate import UnivariateSpline
+import matplotlib.dates as mdates
+import datetime as dt
+from scipy.stats import norm
+import statsmodels.api as sm
+from scipy.optimize import minimize
+from scipy.integrate import quad
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+#!pip install nbconvert[webpdf]
+#!playwright install chromium
+
+import requests
+#%pip install twelvedata
+from twelvedata import TDClient
+from datetime import datetime, timedelta
+
+pd.set_option("display.float_format", "{:.8f}".format)
+plt.rcParams.update({'font.size':13})
+%config InlineBackend.figure_format = 'retina'
+%matplotlib inline
+
+
+ticker = yf.Ticker("TSM")
+expiries = ticker.options
+print(expiries)
+
+# Breeden-Litzenberger to pull implied PDF from available options
+T = 0.5
+r = 0.045
+expiry = expiries[9]
+print(f"Expiry: {expiry}")
+chain = ticker.option_chain(expiry)
+
+calls = chain.calls
+puts = chain.puts
+
+print(f"Call Shape: {calls.shape}")
+
+calls['mid'] = (calls['bid'] + calls['ask'])/2
+calls = calls.dropna(subset=['mid'])
+calls = calls.sort_values('strike')
+
+calls = chain.calls.copy()
+
+
+# when bid/ask are zero, fallback to LastPrice
+calls['mid'] = np.where(
+    (calls['bid'] == 0) & (calls['ask'] == 0),
+    calls['lastPrice'],
+    (calls['bid'] + calls['ask'])/2
+)
+
+calls = calls[calls['mid'] > 0]
+calls = calls.sort_values('strike')
+
+spot = ticker.history(period="1d")['Close'].iloc[-1]
+
+def bs_delta(S, K, T, r, sigma, option_type):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    
+    if option_type == 'call':
+        return norm.cdf(d1)
+    elif option_type == 'put':
+        return norm.cdf(d1) - 1
+
+calls['delta'] = calls.apply(
+    lambda row: bs_delta(
+        S=spot,
+        K=row['strike'],
+        T=T,
+        r=r,
+        sigma=row['impliedVolatility'],
+        option_type='call'
+    ),
+    axis=1
+)
+
+calls = calls[(calls['strike'] > 0.5*spot) & (calls['strike'] < 1.5*spot)]
+K = calls['strike'].values
+C = calls['mid'].values
+ask = calls['ask'].values
+
+# smoothing spline
+spline = UnivariateSpline(K, C, s=1)
+
+
+# code for supportive plots (Visuals)
+d2C_dK2 = spline.derivative(n=2)(K)
+
+pdf = np.exp(r*T) * d2C_dK2
+pdf = np.maximum(pdf, 0)
+pdf = pdf / np.trapz(pdf, K)
+exp_value = np.trapz(K*pdf, K)
+
+mu = exp_value
+var = np.trapz((K - mu)**2 * pdf, K)
+sigma = np.sqrt(var)
+skewness = np.trapz(((K - mu) / sigma)**3 * pdf, K)
+cdf = np.cumsum(pdf) * np.mean(np.diff(K))
+
+p10 = K[np.searchsorted(cdf, 0.10)]
+p25 = K[np.searchsorted(cdf, 0.25)]
+p50 = K[np.searchsorted(cdf, 0.50)]
+p75 = K[np.searchsorted(cdf, 0.75)]
+p90 = K[np.searchsorted(cdf, 0.90)]
+
+plt.plot(K, pdf)
+plt.title('Market-Implied PDF for TSM')
+plt.xlabel('Price at Expiry')
+plt.ylabel('Probability Density')
+plt.show()
+
+plt.imshow(pdf.reshape(1, -1), cmap='viridis', aspect='auto',
+           extent=[K.min(), K.max(), 0, 1])
+plt.title('Market Implied Price Distribution Heatmap')
+plt.xlabel('Price at Expiry')
+plt.yticks([])
+plt.tight_layout()
+plt.savefig('Market Implied Price Distribution Heatmap (TSM)')
+plt.show()
+
+
+# Use BL Model for TSM 
+ticker2 = yf.Ticker("TSM")
+hist = ticker2.history(period='3y')
+expiry_date = pd.to_datetime("2026-06-18")
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14,6), gridspec_kw={'width_ratios': [2, 1]})
+
+ax1.plot(hist.index, hist['Close'], color='black', label='Historical Price', zorder=3)
+
+expiry_num = mdates.date2num(expiry_date.to_pydatetime())
+pdf_scaled = pdf / pdf.max() * 20   # adjust width
+
+ax1.fill_betweenx(K, expiry_date, expiry_num + pdf_scaled, 
+                 color='purple', alpha=0.3, label='Market-Implied Density', zorder=1)
+
+ax1.scatter(expiry_date, exp_value, color='red', s=80, label='Expected Value')
+ax1.axvline(expiry_date, color='grey', linestyle='--', alpha=0.7)
+
+ax1.set_title('Historical Price with Market-Implied Future Distribution')
+ax1.set_xlabel('Date')
+ax1.set_xlim(
+    dt.datetime(2023, 1, 1),
+    dt.datetime(2026, 12, 31)
+)
+ax1.set_ylabel('Price')
+ax1.set_ylim(0, 500)
+ax1.legend()
+ax1.xaxis_date()
+fig.autofmt_xdate()
+
+ax2.plot(K, pdf, color='purple')
+ax2.set_title('Market-Implied PDF at Expiry')
+ax2.set_xlabel('Price at Expiry')
+ax2.set_ylabel('Probability Density')
+
+plt.tight_layout()
+plt.savefig('Market Implied Dist (Horizontal)')
+plt.show()
+
+# plot of TSM Volatility smile
+plt.plot(K, calls['impliedVolatility'])
+plt.title('Volatility Smile for TSM')
+plt.xlabel('Strike Prices')
+plt.ylabel('Implied Volatility')
+plt.show()
+
+
+# Monte Carlo Valuation (1)
+spot = hist['Close'].iloc[-1]
+T = 1.0
+steps = 252
+n_sims = 10_000
+dt = T / steps
+returns = hist['Close'].pct_change().dropna()
+sigma = returns.std() * np.sqrt(252)
+
+mu = returns.mean() * 252
+paths = np.zeros((steps + 1, n_sims))
+paths[0] = spot
+rand = np.random.normal(0,1, (steps, n_sims))
+
+for t in range(1, steps + 1):
+    paths[t] = paths[t-1] * np.exp((mu-0.5*sigma**2)*dt + sigma*np.sqrt(dt)*rand[t-1])
+terminal_prices = paths[-1]
+
+p5, p25, p50, p75, p95 = np.percentile(terminal_prices, [5, 25, 50, 75, 95])
+mean_terminal = terminal_prices.mean()
+
+
+
+fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+
+axs[0].hist(terminal_prices, bins=50, density=True, alpha=0.8, color='cornflowerblue')
+axs[0].axvline(mean_terminal, color='red', linestyle='--', label='Mean Price')
+axs[0].axvline(spot.item(), color='black', linestyle=':', label='Current Price')
+axs[0].set_title('Distribution of TSM Terminal Prices')
+axs[0].set_xlabel('Share Price ($)')
+axs[0].set_ylabel('Density')
+axs[0].legend(fontsize=10)
+axs[0].tick_params(axis='x', rotation=45)
+axs[1].tick_params(direction='in')
+
+axs[1].plot(paths[:, :200], color='cornflowerblue', alpha=0.4)
+axs[1].set_title('TSM Simulated Price Paths')
+axs[1].set_xlabel('Time Step (Days)')
+axs[1].set_ylabel('Share Price ($)')
+axs[1].legend(fontsize=10)
+axs[1].tick_params(axis='x', rotation=45)
+axs[1].tick_params(direction='in')
+
+plt.tight_layout()
+plt.savefig('TSM Monte Carlo')
+plt.show()
+
+# Heston Monte Carlo for conservative valuation (2)
+weights=None
+
+kappa = 2.0  # speed of mean reversion
+theta = 0.04  # long-run variance (20% vol^2)
+sigma_v = 0.3   # vol of vol
+rho = -0.7    # negative correlation typical for equities
+v0 = 0.04     # initial variance
+
+mu = 0.05
+
+z1 = np.random.normal(size=(steps, n_sims))
+z2 = np.random.normal(size=(steps, n_sims))
+z2 = rho*z1 + np.sqrt(1-rho**2)*z2
+
+S = np.zeros((steps + 1, n_sims))
+V = np.zeros((steps + 1, n_sims))
+
+S[0, :] = spot
+V[0, :] = v0
+
+for t in range(1, steps + 1):   # full truncation Euler
+    V[t] = np.maximum(
+        V[t-1] + kappa*(theta - V[t-1])*dt + sigma_v*np.sqrt(np.maximum(V[t-1],0)*dt) * z2[t-1],
+    0
+    )
+    #Price Process
+    S[t] = S[t-1] *np.exp(
+        (mu-0.5*V[t-1])*dt + np.sqrt(V[t-1]*dt) * z1[t-1]
+    )
+    if weights is None:
+        weights = np.ones(n_sims)
+
+    weights = np.asarray(weights)
+    weights = weights / np.sum(weights)  # normalize
+
+    # ---- Compute mean weighted paths ----
+    mean_weighted_S_TSM = S @ weights
+    mean_weighted_V_TSM = V @ weights
+
+    time_grid = np.linspace(0, T, steps + 1)
+
+terminal_prices = S[-1]
+
+p5, p25, p50, p75, p95 = np.percentile(terminal_prices, [5, 25, 50, 75, 95])
+mean_terminal = terminal_prices.mean()
+
+
+fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+
+axs[0].hist(terminal_prices, bins=50, density=True, alpha=0.8, color='cornflowerblue')
+axs[0].axvline(mean_terminal, color='red', linestyle='--', label='Mean')
+axs[0].axvline(spot.item(), color='black', linestyle=':', label='Current Price')
+axs[0].set_title('Heston Monte Carlo Terminal Price Distribution')
+axs[0].set_xlabel('Share Price ($)')
+axs[0].set_ylabel('Density')
+axs[0].legend(fontsize=10)
+axs[0].tick_params(axis='x', rotation=45)
+axs[1].tick_params(direction='in')
+
+axs[1].plot(S[:, :200], color='cornflowerblue', alpha=0.4)
+axs[1].set_title('Heston Stochastic Volatility Monte Carlo Paths')
+axs[1].set_xlabel('Time Step (Days)')
+axs[1].set_ylabel('Share Price ($)')
+axs[1].legend(fontsize=10)
+axs[1].tick_params(axis='x', rotation=45)
+axs[1].tick_params(direction='in')
+
+plt.tight_layout()
+plt.savefig('TSM Heston Monte Carlo')
+plt.show()
+
+
+# Synthetic Portolio to help value TSM (3)
+# The idea here is to generate a portfolio of stocks that replicates the behaviour of TSM's stock, forecast how these stocks perform over the next year and use this to infer a price for TSM in one year using correlations after proving they hold.
+
+# Import Portfolio Data
+sma_period = 21   # 2 week average
+atr_period = 14
+def calc_atr(GOOG, period=20): # 20 for 3.33 day ATR on 4H intervals
+    high_low = GOOG['High'] - GOOG['Low']
+    high_close = abs(GOOG['High'] - GOOG['Close'].shift())
+    low_close = abs(GOOG['Low'] - GOOG['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+NVDA = pd.DataFrame(yf.download('NVDA', period='1y', interval='1h', auto_adjust='True'))
+NVDA = NVDA.dropna()
+NVDA['Av Price'] = (NVDA['High'] + NVDA['Low'] + NVDA['Close'] + NVDA['Open']) / 4
+NVDA['Tomorrow'] = NVDA['Close'].shift(-1)
+NVDA['log_ret'] = np.log(NVDA['Close'] / NVDA['Close'].shift(1))
+NVDA['log_ret'] = (NVDA['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
+NVDA['SMA21'] = NVDA['Close'].rolling(window=21).mean()
+NVDA['SMA50'] = NVDA['Close'].rolling(window=50).mean()
+NVDA['ATR'] = calc_atr(NVDA, period=atr_period)
+NVDA['Rolling Daily Vol'] = NVDA['log_ret'].rolling(window=20).std()
+NVDA['Pct Change'] = (NVDA['Close'] - NVDA['Close'].shift(1))/NVDA['Close'].shift(1)
+NVDA.dropna(subset=[('SMA21',''), ('ATR','')], inplace=True)
+NVDA.index = NVDA.index.tz_localize(None)
+
+TSM = pd.DataFrame(yf.download('TSM', period='1y', interval='1h', auto_adjust='True'))
+TSM = TSM.dropna()
+TSM['Av Price'] = (TSM['High'] + TSM['Low'] + TSM['Close'] + TSM['Open']) / 4
+TSM['Tomorrow'] = TSM['Close'].shift(-1)
+TSM['log_ret'] = np.log(TSM['Close'] / TSM['Close'].shift(1))
+TSM['log_ret'] = (TSM['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
+TSM['SMA21'] = TSM['Close'].rolling(window=21).mean()
+TSM['SMA50'] = TSM['Close'].rolling(window=50).mean()
+TSM['ATR'] = calc_atr(TSM, period=atr_period)
+TSM['Rolling Daily Vol'] = TSM['log_ret'].rolling(window=20).std()
+TSM['Pct Change'] = (TSM['Close'] - TSM['Close'].shift(1))/TSM['Close'].shift(1)
+TSM.dropna(subset=[('SMA21',''), ('ATR','')], inplace=True)
+TSM.index = TSM.index.tz_localize(None)
+
+SMH = pd.DataFrame(yf.download('SMH', period='1y', interval='1h', auto_adjust='True'))
+SMH = SMH.dropna()
+SMH['Av Price'] = (SMH['High'] + SMH['Low'] + SMH['Close'] + SMH['Open']) / 4
+SMH['Tomorrow'] = SMH['Close'].shift(-1)
+SMH['log_ret'] = np.log(SMH['Close'] / SMH['Close'].shift(1))
+SMH['log_ret'] = (SMH['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
+SMH['SMA21'] = SMH['Close'].rolling(window=21).mean()
+SMH['SMA50'] = SMH['Close'].rolling(window=50).mean()
+SMH['ATR'] = calc_atr(SMH, period=atr_period)
+SMH['Rolling Daily Vol'] = SMH['log_ret'].rolling(window=20).std()
+SMH['Pct Change'] = (SMH['Close'] - SMH['Close'].shift(1))/SMH['Close'].shift(1)
+SMH.dropna(subset=[('SMA21',''), ('ATR','')], inplace=True)
+SMH.index = SMH.index.tz_localize(None)
+
+COP1 = pd.DataFrame(yf.download('HG=F', period='1y', interval='1h', auto_adjust='True'))
+COP1 = COP1.dropna()
+start = pd.Timestamp("2025-02-10")
+end   = pd.Timestamp("2025-05-28")
+COP2 = pd.DataFrame(yf.download('HG=F', start, end, interval='1h', auto_adjust='True'))
+COP2 = COP2.dropna()
+COP = pd.concat([COP1, COP2])
+COP = COP.sort_index()
+COP = COP[~COP.index.duplicated(keep='first')]
+COP['Av Price'] = (COP['High'] + COP['Low'] + COP['Close'] + COP['Open']) / 4
+COP['Tomorrow'] = COP['Close'].shift(-1)
+COP['log_ret'] = np.log(COP['Close'] / COP['Close'].shift(1))
+COP['log_ret'] = (COP['log_ret'].replace([np.inf, -np.inf], np.nan).dropna())
+COP['SMA21'] = COP['Close'].rolling(window=21).mean()
+COP['SMA50'] = COP['Close'].rolling(window=50).mean()
+COP['ATR'] = calc_atr(COP, period=atr_period)
+COP['Rolling Daily Vol'] = COP['log_ret'].rolling(window=20).std()
+COP['Pct Change'] = (COP['Close'] - COP['Close'].shift(1))/COP['Close'].shift(1)
+COP.dropna(subset=[('SMA21',''), ('ATR','')], inplace=True)
+COP.index =  COP.index.tz_localize(None)  # need to keep this in, if the code bugs here either change the convert to a localize or just hash it #.
+
+# We chose NVDA for a market leading representative, Copper for our metal representative given it is the most used metal in semiconducting and the VanEck semiconductor ETF for an industry overview representative.
+
+aligned = pd.merge_asof(
+    NVDA.sort_index(),
+    COP.sort_index(),
+    left_index=True,
+    right_index=True,
+    direction="backward"
+)
+
+portfolio = pd.merge_asof(
+    aligned.sort_index(),
+    SMH.sort_index(),
+    left_index=True,
+    right_index=True,
+    direction="backward"
+)
+
+df = pd.concat([SMH['log_ret'], NVDA['log_ret']], axis=1).dropna()
+df.columns = ["SMH", "NVDA"]
+
+X = sm.add_constant(df["NVDA"])
+model = sm.OLS(df["SMH"], X).fit()
+
+SMH_NN = model.resid  # returns SMH log_ret wihout NVDA
+
+# Plot of the rolling correlations historically
+# Rolling Correlations for the Stocks & Portfolio of Closes for coding use
+df = pd.concat(
+    [TSM['log_ret'], portfolio['log_ret_y']],
+    axis=1
+).dropna()
+
+datetime = pd.date_range(start='2025-01-01', periods=len(SMH['Av Price']), freq='5.25h')
+
+port_close = pd.concat([
+    portfolio['log_ret_x'].rename('NVDA'),
+    portfolio['log_ret_y'].rename('cop'),
+    portfolio['log_ret'].rename('SHM')
+], axis=1)
+
+rho_N = TSM['log_ret'].rolling(252).corr(NVDA['log_ret'])
+rho_V = TSM['log_ret'].rolling(252).corr(SMH['log_ret'])
+rho_T = df.iloc[:,0].rolling(252).corr(df.iloc[:,1])
+print(f"rho_N: {rho_N.mean()}")
+print(f"rho_V: {rho_V.mean()}")
+print(f"rho_T: {rho_T.mean()}")
+
+# --- Plots of the rolling correlations over time -- #
+plt.plot(datetime, rho_N, label='NVDA', color='red', alpha=0.6)
+plt.plot(datetime, rho_V[:len(SMH['Av Price'])], label='VanEck', color='blue', alpha=0.6)
+plt.plot(datetime, rho_T[:len(SMH['Av Price'])], label='COP Spot', color='green', alpha=0.6)
+plt.xlabel('Date')
+plt.xticks(rotation=45)
+plt.ylabel(r'Correlation $(0 \leq \rho \leq 1 )$')
+plt.title('Individual Rolling Correlations Compared to TSM')
+plt.legend(fontsize=10)
+plt.tick_params(direction='in')
+plt.tight_layout()
+plt.savefig('Rolling Correlations')
+plt.grid()
+plt.show()
+
+# Run Monte Carlo's for all individual parts, NVDA, Copper, VanEck (I will give the code for one)
+# -------  NVDA Monte Carlo
+weights=None
+spot = NVDA['Close'].iloc[-1]
+T = 1.0
+steps = 252
+n_sims = 10_000
+dt = T / steps
+returns = NVDA['Pct Change'].dropna()
+sigma = returns.std() * np.sqrt(252)
+
+mu = returns.mean() * 252
+paths_NVDA = np.zeros((steps + 1, n_sims))
+paths_NVDA[0] = spot.iloc[0]
+rand = np.random.normal(0,1, (steps, n_sims))
+
+for t in range(1, steps + 1):
+    paths_NVDA[t] = paths_NVDA[t-1] * np.exp((mu-0.5*sigma**2)*dt + sigma*np.sqrt(dt)*rand[t-1])
+    if weights is None:
+        weights = np.ones(n_sims)
+
+    weights = np.asarray(weights)
+    weights = weights / np.sum(weights)  # normalize
+
+    # ---- Compute mean weighted paths ----
+    mean_weighted_S_NVDA = paths_NVDA @ weights
+    mean_weighted_V_NVDA = V @ weights
+
+    time_grid = np.linspace(0, T, steps + 1)
+terminal_prices_NVDA = paths_NVDA[-1]
+
+NVDA_p5, p25, p50, p75, NVDA_p95 = np.percentile(terminal_prices_NVDA, [5, 25, 50, 75, 95])
+mean_terminal_NVDA = terminal_prices_NVDA.mean()
+
+fig, axs = plt.subplots(1, 2, figsize=(16, 6))
+
+axs[0].plot(paths_NVDA[:, :200], color='cornflowerblue', alpha=0.4)
+axs[0].set_title('NVDA Simulated Price Paths')
+axs[0].set_xlabel('Time Step (Days)')
+axs[0].set_ylabel('Share Price ($)')
+axs[0].tick_params(axis='x', rotation=45)
+axs[0].tick_params(direction='in')
+
+axs[1].hist(terminal_prices_NVDA, bins=50, density=True, alpha=0.8, color='cornflowerblue')
+axs[1].axvline(mean_terminal_NVDA, color='red', linestyle='--', label='Mean')
+axs[1].axvline(spot.iloc[0], color='black', linestyle=':', label='Current Price')
+axs[1].axvline(NVDA_p5, color='green', linestyle=':', label=f'Max Tail Risk Price (5%): ${NVDA_p5:,.3f}')
+axs[1].set_title('Distribution of NVDA Terminal Prices')
+axs[1].set_xlabel('Share Price($)')
+axs[1].set_ylabel('Density')
+axs[1].legend(fontsize=12)
+axs[1].tick_params(axis='x', rotation=45)
+axs[1].tick_params(direction='in')
+
+plt.tight_layout()
+plt.savefig('NVDA Monte Sim (Synth)')
+plt.show()
+
+
+# ----------------------------------------------
+Based on the simulated returns of the synthetic pieces individually, I can calculate an expected return for our TSM counterpart using the equation <br>
+<center> $\mathbb{E} [R_B | R_A=r] = \mu_B + \rho \frac{\sigma_B}{\sigma_A} (r-\mu_A) $  </center> <br>
+where $R_B$ is our TSM return per individual return $R_A$ for each synthetic piece. The total projected portfolio return will be the summation.
+
+----------------------------------------------
+
+#  ---- Weights Optimise on Sharpe
+NVDA_sharpe = mean_terminal_NVDA/NVDA_p5
+COP_sharpe = mean_terminal_COP/COP_p5
+SMH_sharpe = mean_terminal_SMH/SMH_p5
+weights_reward = np.array
+total_sharpe = NVDA_sharpe + COP_sharpe + SMH_sharpe
+port_weights = np.array([NVDA_sharpe/total_sharpe, COP_sharpe/total_sharpe,  SMH_sharpe/total_sharpe])   # normalised optimal weights
+
+# ----- Weights Optimised on Reward
+spot_NVDA = NVDA['Close'].iloc[-1].item()
+spot_COP = COP['Close'].iloc[-1].item()
+spot_SMH = SMH['Close'].iloc[-1].item()
+total_spot = spot_NVDA + spot_COP + spot_SMH
+total_terminal = mean_terminal_NVDA + mean_terminal_COP + mean_terminal_SMH
+normalise = total_terminal - total_spot
+weights_reward = np.array([(mean_terminal_NVDA-spot_NVDA)/normalise, (mean_terminal_COP-spot_COP)/normalise, 
+                           (mean_terminal_SMH-spot_SMH)/normalise])
+
+# summation of individual contributions
+NVDA_cont = np.zeros(252)
+SMH_cont = np.zeros(252)
+COP_cont = np.zeros(252)
+for t in range(0,252):
+    NVDA_cont[t] = (TSM['SMA21'].iloc[-1] + 
+             (rho_N.iloc[-1]*(TSM['Rolling Daily Vol'].iloc[-1].item()/NVDA['Rolling Daily Vol'].iloc[-1].item())*
+              (mean_weighted_S_NVDA[t] - NVDA['SMA21'].iloc[-1])
+             ))
+    SMH_cont[t] = (TSM['SMA21'].iloc[-1] + 
+             (rho_V.iloc[-1]*(TSM['Rolling Daily Vol'].iloc[-1].item()/SMH['Rolling Daily Vol'].iloc[-1].item())*
+              (mean_weighted_S_SMH[t] - SMH['SMA21'].iloc[-1])
+             ))
+    COP_cont[t] = (TSM['SMA21'].iloc[-1] + 
+             rho_T.iloc[-1]*(TSM['Rolling Daily Vol'].iloc[-1].item()/COP['Rolling Daily Vol'].iloc[-1].item())*
+                   (mean_weighted_S_COP[t] - COP['SMA21'].iloc[-1]))
+
+port_cont = np.array([NVDA_cont, COP_cont, SMH_cont])
+portfolio_path = np.dot(weights_reward,port_cont)
+
+portfolio_path[-1] # gives the final predicted price.
+
+
+
