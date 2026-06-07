@@ -1,0 +1,587 @@
+# This is a draft of my market making model used in IMC prosperity given I cannot find the optimal one I made.
+
+from datamodel import OrderDepth, TradingState, Order
+from typing import List, Dict, Tuple
+import math
+import jsonpickle
+
+
+class Trader:
+    def __init__(self):
+        self.position_limits = {
+            "HYDROGEL_PACK": 200,
+            "VELVETFRUIT_EXTRACT": 200,
+        }
+
+        # Persistent state
+        self.prev_mid = {}
+        self.mid_history = {
+            "HYDROGEL_PACK": [],
+            "VELVETFRUIT_EXTRACT": [],
+        }
+
+        # ---------- HYDRO GEL PARAMETERS ----------
+        self.hydro_fair = 10000
+
+        # Mid-regime triggers
+        self.hydro_mid_buy_trigger = 9995
+        self.hydro_mid_sell_trigger = 10005
+
+        # Aggressive-taking thresholds around fair
+        self.hydro_take_buy_edge = 3
+        self.hydro_take_sell_edge = 3
+
+        # Extra aggression when mid is far from fair
+        self.hydro_extra_aggression_ticks = 2
+        self.hydro_extra_take_size = 8
+
+        # Inventory skew
+        self.hydro_inventory_step = 30
+
+        # Opportunistic inventory clearing
+        self.hydro_clear_width = 3
+
+        # Passive quoting layers
+        self.hydro_layers = [7]
+        self.hydro_layer_sizes = [8]
+
+        # ---------- VELVET FRUIT PARAMETERS ----------
+        self.velv_window = 2
+        self.velv_reversion = 0.02
+        self.velv_imbalance_weight = -0.2
+
+        self.velv_take_buy_edge = 2
+        self.velv_take_sell_edge = 2
+
+        self.velv_inventory_step = 30
+        self.velv_clear_width = 3
+
+        self.velv_layers = [2]
+        self.velv_layer_sizes = [5]
+
+        # ---------- BASE TAKE SIZES ----------
+        self.base_take_size = {
+            "HYDROGEL_PACK": 25,
+            "VELVETFRUIT_EXTRACT": 15,
+        }
+
+        # ---------- IMBALANCE FILTERS ----------
+        self.velv_buy_imbalance_floor = -0.01
+        self.velv_sell_imbalance_cap = 0.01
+
+    # =========================================================
+    # ----------------- HELPER FUNCTIONS ----------------------
+    # =========================================================
+
+    def get_mid_price(self, order_depth: OrderDepth, product: str) -> float:
+        if len(order_depth.buy_orders) > 0 and len(order_depth.sell_orders) > 0:
+            best_bid = max(order_depth.buy_orders.keys())
+            best_ask = min(order_depth.sell_orders.keys())
+            mid = (best_bid + best_ask) / 2
+            self.prev_mid[product] = mid
+            return mid
+
+        default_price = self.hydro_fair if product == "HYDROGEL_PACK" else self.hydro_fair
+        return self.prev_mid.get(product, default_price)
+
+    def get_trend_slope(self, product: str, window: int = 10) -> float:
+        history = self.mid_history[product]
+        if len(history) < window:
+            return 0.0
+        recent = history[-window:]
+        return (recent[-1] - recent[0]) / (window)
+
+    def get_book_imbalance(self, order_depth: OrderDepth, levels: int = 3) -> float:
+        bid_prices = sorted(order_depth.buy_orders.keys(), reverse=True)[:levels]
+        ask_prices = sorted(order_depth.sell_orders.keys())[:levels]
+
+        bid_volume = sum(order_depth.buy_orders[p] for p in bid_prices)
+        ask_volume = sum(abs(order_depth.sell_orders[p]) for p in ask_prices)
+
+        total = bid_volume + ask_volume
+        if total == 0:
+            return 0.0
+
+        return (bid_volume - ask_volume) / total
+
+    def clamp_history(self, product: str):
+        max_len = 30
+        if len(self.mid_history[product]) > max_len:
+            self.mid_history[product] = self.mid_history[product][-max_len:]
+
+    def update_mid_history(self, product: str, mid: float):
+        self.mid_history[product].append(mid)
+        self.clamp_history(product)
+
+    def inventory_skew_ticks(self, position: int, step: int) -> int:
+        if step <= 0:
+            return 0
+        return int(position / step)
+
+    def get_remaining_buy_capacity(self, product: str, position: int, buy_order_volume: int) -> int:
+        return max(0, self.position_limits[product] - position - buy_order_volume)
+
+    def get_remaining_sell_capacity(self, product: str, position: int, sell_order_volume: int) -> int:
+        return max(0, self.position_limits[product] + position - sell_order_volume)
+
+    # =========================================================
+    # ---------------- FAIR VALUE FUNCTIONS -------------------
+    # =========================================================
+
+    def get_fair_price_hydro(self, position: int) -> float:
+        return float(self.hydro_fair)
+
+    def get_fair_price_velv(self, order_depth: OrderDepth) -> float:
+        mid = self.get_mid_price(order_depth, "VELVETFRUIT_EXTRACT")
+        self.update_mid_history("VELVETFRUIT_EXTRACT", mid)
+
+        history = self.mid_history["VELVETFRUIT_EXTRACT"]
+        n = min(len(history), self.velv_window)
+        rolling_mean = sum(history[-n:]) / max(1, n)
+
+        #imbalance = self.get_book_imbalance(order_depth, levels=3)
+        trend = self.get_trend_slope("VELVETFRUIT_EXTRACT", window=3)
+
+        fair = (
+            rolling_mean
+            + trend
+            + self.velv_reversion * (rolling_mean - mid)
+        )
+        return fair
+
+    # =========================================================
+    # ---------- PROFIT-RANKED AGGRESSIVE TAKING --------------
+    # =========================================================
+
+    def take_best_buy_opportunities(
+        self,
+        product: str,
+        fair_price: float,
+        orders: List[Order],
+        order_depth: OrderDepth,
+        position: int,
+        buy_order_volume: int,
+        max_clip: int,
+        min_edge: float,
+    ) -> int:
+        """
+        Rank buy opportunities by expected profit score:
+            score = edge * executable_quantity
+        where executable_quantity is approximated by min(level_volume, max_clip).
+
+        This is better than sorting only by edge because it includes size.
+        """
+        opportunities: List[Tuple[float, float, int, int]] = []
+
+        for ask_price, signed_volume in order_depth.sell_orders.items():
+            ask_volume = -signed_volume
+            edge = fair_price - ask_price
+
+            if edge >= min_edge and ask_volume > 0:
+                executable = min(ask_volume, max_clip)
+                score = edge * executable
+                opportunities.append((score, edge, ask_price, ask_volume))
+
+        # Highest total estimated profit first
+        # Tie-break: higher edge, then lower ask
+        opportunities.sort(key=lambda x: (-x[0], -x[1], x[2]))
+
+        limit = self.position_limits[product]
+
+        for score, edge, ask_price, ask_volume in opportunities:
+            remaining = limit - position - buy_order_volume
+            if remaining <= 0:
+                break
+
+            quantity = min(ask_volume, max_clip, remaining)
+            if quantity > 0:
+                orders.append(Order(product, ask_price, quantity))
+                buy_order_volume += quantity
+
+        return buy_order_volume
+
+    def take_best_sell_opportunities(
+        self,
+        product: str,
+        fair_price: float,
+        orders: List[Order],
+        order_depth: OrderDepth,
+        position: int,
+        sell_order_volume: int,
+        max_clip: int,
+        min_edge: float,
+    ) -> int:
+        """
+        Rank sell opportunities by expected profit score:
+            score = edge * executable_quantity
+        where executable_quantity is approximated by min(level_volume, max_clip).
+        """
+        opportunities: List[Tuple[float, float, int, int]] = []
+
+        for bid_price, bid_volume in order_depth.buy_orders.items():
+            edge = bid_price - fair_price
+
+            if edge >= min_edge and bid_volume > 0:
+                executable = min(bid_volume, max_clip)
+                score = edge * executable
+                opportunities.append((score, edge, bid_price, bid_volume))
+
+        # Highest total estimated profit first
+        # Tie-break: higher edge, then higher bid
+        opportunities.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+
+        limit = self.position_limits[product]
+
+        for score, edge, bid_price, bid_volume in opportunities:
+            remaining = limit + position - sell_order_volume
+            if remaining <= 0:
+                break
+
+            quantity = min(bid_volume, max_clip, remaining)
+            if quantity > 0:
+                orders.append(Order(product, bid_price, -quantity))
+                sell_order_volume += quantity
+
+        return sell_order_volume
+
+    def take_hydro(
+        self,
+        fair_price: float,
+        mid_price: float,
+        orders: List[Order],
+        order_depth: OrderDepth,
+        position: int,
+        buy_order_volume: int,
+        sell_order_volume: int,
+    ):
+        buy_edge = self.hydro_take_buy_edge
+        sell_edge = self.hydro_take_sell_edge
+        buy_clip = self.base_take_size["HYDROGEL_PACK"]
+        sell_clip = self.base_take_size["HYDROGEL_PACK"]
+
+        if mid_price <= self.hydro_mid_buy_trigger:
+            buy_edge = max(0, buy_edge - self.hydro_extra_aggression_ticks)
+            buy_clip += self.hydro_extra_take_size
+
+        if mid_price >= self.hydro_mid_sell_trigger:
+            sell_edge = max(0, sell_edge - self.hydro_extra_aggression_ticks)
+            sell_clip += self.hydro_extra_take_size
+
+        buy_order_volume = self.take_best_buy_opportunities(
+            "HYDROGEL_PACK",
+            fair_price,
+            orders,
+            order_depth,
+            position,
+            buy_order_volume,
+            buy_clip,
+            buy_edge,
+        )
+
+        sell_order_volume = self.take_best_sell_opportunities(
+            "HYDROGEL_PACK",
+            fair_price,
+            orders,
+            order_depth,
+            position,
+            sell_order_volume,
+            sell_clip,
+            sell_edge,
+        )
+
+        return buy_order_volume, sell_order_volume
+
+    def take_velv(
+        self,
+        fair_price: float,
+        orders: List[Order],
+        order_depth: OrderDepth,
+        position: int,
+        buy_order_volume: int,
+        sell_order_volume: int,
+    ):
+        imbalance = self.get_book_imbalance(order_depth, levels=3)
+
+        if imbalance > self.velv_buy_imbalance_floor:
+            buy_order_volume = self.take_best_buy_opportunities(
+                "VELVETFRUIT_EXTRACT",
+                fair_price,
+                orders,
+                order_depth,
+                position,
+                buy_order_volume,
+                self.base_take_size["VELVETFRUIT_EXTRACT"],
+                self.velv_take_buy_edge,
+            )
+
+        if imbalance < self.velv_sell_imbalance_cap:
+            sell_order_volume = self.take_best_sell_opportunities(
+                "VELVETFRUIT_EXTRACT",
+                fair_price,
+                orders,
+                order_depth,
+                position,
+                sell_order_volume,
+                self.base_take_size["VELVETFRUIT_EXTRACT"],
+                self.velv_take_sell_edge,
+            )
+
+        return buy_order_volume, sell_order_volume
+
+    # =========================================================
+    # ------------ OPPORTUNISTIC INVENTORY CLEARING -----------
+    # =========================================================
+
+    def clear_position_order(
+        self,
+        product: str,
+        fair_value: float,
+        width: float,
+        orders: List[Order],
+        order_depth: OrderDepth,
+        position: int,
+        buy_order_volume: int,
+        sell_order_volume: int,
+    ):
+        position_after_take = position + buy_order_volume - sell_order_volume
+
+        fair_for_bid = round(fair_value - width)
+        fair_for_ask = round(fair_value + width)
+
+        buy_capacity = self.get_remaining_buy_capacity(product, position, buy_order_volume)
+        sell_capacity = self.get_remaining_sell_capacity(product, position, sell_order_volume)
+
+        if position_after_take > 20:
+            clear_quantity = sum(
+                volume for price, volume in order_depth.buy_orders.items() if price >= fair_for_ask
+            )
+            clear_quantity = min(clear_quantity, position_after_take)
+            sent_quantity = min(sell_capacity, clear_quantity)
+
+            if sent_quantity > 0:
+                orders.append(Order(product, fair_for_ask, -abs(sent_quantity)))
+                sell_order_volume += abs(sent_quantity)
+
+        if position_after_take < -20:
+            clear_quantity = sum(
+                abs(volume) for price, volume in order_depth.sell_orders.items() if price <= fair_for_bid
+            )
+            clear_quantity = min(clear_quantity, abs(position_after_take))
+            sent_quantity = min(buy_capacity, clear_quantity)
+
+            if sent_quantity > 0:
+                orders.append(Order(product, fair_for_bid, abs(sent_quantity)))
+                buy_order_volume += abs(sent_quantity)
+
+        return buy_order_volume, sell_order_volume
+
+    # =========================================================
+    # ---------------- PASSIVE QUOTING ------------------------
+    # =========================================================
+
+    def make_quotes_hydro(
+        self,
+        fair_price: float,
+        mid_price: float,
+        position: int,
+        buy_order_volume: int,
+        sell_order_volume: int,
+    ) -> List[Order]:
+        orders = []
+
+        skew = self.inventory_skew_ticks(position, self.hydro_inventory_step)
+
+        buy_capacity = self.get_remaining_buy_capacity("HYDROGEL_PACK", position, buy_order_volume)
+        sell_capacity = self.get_remaining_sell_capacity("HYDROGEL_PACK", position, sell_order_volume)
+
+        for i, width in enumerate(self.hydro_layers):
+            bid_price = math.floor(fair_price - width - skew)
+            ask_price = math.ceil(fair_price + width - skew)
+
+            if mid_price >= self.hydro_mid_sell_trigger:
+                ask_price += 1
+                bid_price += 1
+            elif mid_price <= self.hydro_mid_buy_trigger:
+                bid_price -= 1
+                ask_price -= 1
+
+            if bid_price >= ask_price:
+                bid_price = int(fair_price) - 1
+                ask_price = int(fair_price) + 1
+
+            size = self.hydro_layer_sizes[i]
+            bid_size = min(size, buy_capacity)
+            ask_size = min(size, sell_capacity)
+
+            if position > 0:
+                bid_size = min(bid_size, max(1, size - position // 20))
+            if position < 0:
+                ask_size = min(ask_size, max(1, size - abs(position) // 20))
+
+            if bid_size > 0:
+                orders.append(Order("HYDROGEL_PACK", bid_price, bid_size))
+                buy_capacity -= bid_size
+
+            if ask_size > 0:
+                orders.append(Order("HYDROGEL_PACK", ask_price, -ask_size))
+                sell_capacity -= ask_size
+
+        return orders
+
+    def make_quotes_velv(
+        self,
+        fair_price: float,
+        position: int,
+        order_depth: OrderDepth,
+        buy_order_volume: int,
+        sell_order_volume: int,
+    ) -> List[Order]:
+        orders = []
+
+        imbalance = self.get_book_imbalance(order_depth, levels=3)
+        skew = self.inventory_skew_ticks(position, self.velv_inventory_step)
+
+        buy_capacity = self.get_remaining_buy_capacity("VELVETFRUIT_EXTRACT", position, buy_order_volume)
+        sell_capacity = self.get_remaining_sell_capacity("VELVETFRUIT_EXTRACT", position, sell_order_volume)
+
+        for i, width in enumerate(self.velv_layers):
+            if buy_capacity <= 0 and sell_capacity <= 0:
+                break
+
+            bid_price = math.floor(fair_price - width - skew)
+            ask_price = math.ceil(fair_price + width - skew)
+
+            if imbalance < -0.01:
+                ask_price -= 2
+            elif imbalance > 0.01:
+                bid_price += 2
+
+            if bid_price >= ask_price:
+                bid_price = math.floor(fair_price) - 1
+                ask_price = math.ceil(fair_price) + 1
+
+            size = self.velv_layer_sizes[i]
+            bid_size = min(size, buy_capacity)
+            ask_size = min(size, sell_capacity)
+
+            if position > 0:
+                bid_size = min(bid_size, max(1, size - position // 20))
+            elif position < 0:
+                ask_size = min(ask_size, max(1, size - abs(position) // 20))
+
+            if bid_size > 0:
+                orders.append(Order("VELVETFRUIT_EXTRACT", bid_price, bid_size))
+                buy_capacity -= bid_size
+
+            if ask_size > 0:
+                orders.append(Order("VELVETFRUIT_EXTRACT", ask_price, -ask_size))
+                sell_capacity -= ask_size
+
+        return orders
+
+    # =========================================================
+    # -------------------- MAIN RUN ---------------------------
+    # =========================================================
+
+    def run(self, state: TradingState):
+        trader_object = {}
+        if state.traderData:
+            trader_object = jsonpickle.decode(state.traderData)
+
+        self.prev_mid = trader_object.get("prev_mid", {})
+        self.mid_history = trader_object.get(
+            "mid_history",
+            {
+                "HYDROGEL_PACK": [],
+                "VELVETFRUIT_EXTRACT": [],
+            },
+        )
+
+        result: Dict[str, List[Order]] = {}
+
+        for product, order_depth in state.order_depths.items():
+            orders: List[Order] = []
+            position = state.position.get(product, 0)
+            buy_order_volume = 0
+            sell_order_volume = 0
+
+            if product == "HYDROGEL_PACK":
+                fair_price = self.get_fair_price_hydro(position)
+                mid_price = self.get_mid_price(order_depth, "HYDROGEL")
+
+                buy_order_volume, sell_order_volume = self.take_hydro(
+                    fair_price,
+                    mid_price,
+                    orders,
+                    order_depth,
+                    position,
+                    buy_order_volume,
+                    sell_order_volume,
+                )
+
+                buy_order_volume, sell_order_volume = self.clear_position_order(
+                    "HYDROGEL_PACK",
+                    fair_price,
+                    self.hydro_clear_width,
+                    orders,
+                    order_depth,
+                    position,
+                    buy_order_volume,
+                    sell_order_volume,
+                )
+
+                effective_position = position + buy_order_volume - sell_order_volume
+
+                orders.extend(
+                    self.make_quotes_hydro(
+                        fair_price,
+                        mid_price,
+                        effective_position,
+                        buy_order_volume,
+                        sell_order_volume,
+                    )
+                )
+
+            elif product == "VELVETFRUIT_EXTRACT":
+                fair_price = self.get_fair_price_velv(order_depth)
+
+                buy_order_volume, sell_order_volume = self.take_velv(
+                    fair_price,
+                    orders,
+                    order_depth,
+                    position,
+                    buy_order_volume,
+                    sell_order_volume,
+                )
+
+                buy_order_volume, sell_order_volume = self.clear_position_order(
+                    "VELVETFRUIT_EXTRACT",
+                    fair_price,
+                    self.velv_clear_width,
+                    orders,
+                    order_depth,
+                    position,
+                    buy_order_volume,
+                    sell_order_volume,
+                )
+
+                effective_position = position + buy_order_volume - sell_order_volume
+
+                orders.extend(
+                    self.make_quotes_velv(
+                        fair_price,
+                        effective_position,
+                        order_depth,
+                        buy_order_volume,
+                        sell_order_volume,
+                    )
+                )
+
+            result[product] = orders
+
+        trader_object["prev_mid"] = self.prev_mid
+        trader_object["mid_history"] = self.mid_history
+        trader_data = jsonpickle.encode(trader_object)
+
+        conversions = 0
+        return result, conversions, trader_data
