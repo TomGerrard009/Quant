@@ -1,0 +1,190 @@
+# useful packages
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import pandas as pd
+import yfinance as yf
+import scipy.stats as stats
+import statsmodels.api as sm
+
+from scipy.linalg import solve_banded
+from scipy.stats import norm
+from scipy.optimize import brentq
+from scipy.optimize import minimize
+
+plt.rcParams.update({'font.size':14})
+
+# Theory
+We will use the Crank-Nicolson method to back work the price of options using the Black Scholes PDE. As a result, we will get a no-arbitrage options price at the current time and be able to create a replicating portfolio under a risk-neutral measure. The Crank-Nicolson method starts by considering the Black Scholes PDE <br>
+<center> $\frac{\partial V}{\partial t} = -\frac{1}{2}\sigma^2 S^2 \frac{\partial ^2V}{\partial S^2} - rS \frac{\partial V}{\partial S} + rV   $</center> <br>
+and turning it into a finite difference problem as follows <br>
+<center> $ \frac{\partial V_i}{\partial t} = -\frac{1}{2}\sigma^2 (i\Delta S^2) \frac{V_{i+1} - 2V_i + V_{i-1}}{\Delta S^2} - r(i\Delta S) \frac{V_{i+1} - V_{i-1}}{2\Delta S} + rV_i.$</center>
+<br> The LHS can be evaulted in a similar fashion as <br>
+<center>$ \frac{V_i^{n+1} - V_i^n}{\Delta t} = \frac{1}{2} L(V_i^{n+1} + V_i^n) $</center>
+<br> where $L$ is the spatial operator as defined in equation (2).
+<br>
+<br>
+The systems can then can evulated and solved as a linear system of equations using matrices, <br>
+$A_i = \frac{1}{2} \sigma^2 i^2 - \frac{ri}{2}$ <br>
+$B_i = -\sigma^2 i^2 - r$ <br>
+$C_i = \frac{1}{2} \sigma^2 i^2 + \frac{ri}{2}$
+<br> and similarly for the time-dependent variables, <br>
+$\alpha_i = \frac{\Delta A_i}{2}$<br>
+$\beta_i = \frac{\Delta B_i}{2}$<br>
+$\gamma_i = \frac{\Delta C_i}{2}$<br>
+Finally, we can solve the Crank-Nicolson by using the equation <br>
+<center>$AV^{n+1} = BV^n + \mathrm{boundary}$ $\mathrm{conditions}$</center> <br>
+
+
+atr_period = 14
+period = 20
+
+def calc_atr(GOOG, period=20): # 20 for 3.33 day ATR on 4H intervals
+    high_low = GOOG['High'] - GOOG['Low']
+    high_close = abs(GOOG['High'] - GOOG['Close'].shift())
+    low_close = abs(GOOG['Low'] - GOOG['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+# Importing data
+Gopt = pd.DataFrame(yf.download('GOOG270115C00380000'))
+Gopt = Gopt.dropna()
+
+GOOG = pd.DataFrame(yf.download('GOOG', period='2y', interval='1h', auto_adjust='True'))
+GOOG = GOOG.dropna()
+GOOG['Av Price'] = (GOOG['High'] + GOOG['Low'] + GOOG['Close'] + GOOG['Open']) / 4
+GOOG['Tomorrow'] = GOOG['Close'].shift(-1)
+GOOG['log_ret'] = np.log(GOOG['Close'] / GOOG['Close'].shift(1))
+GOOG['SMA21'] = GOOG['Av Price'].rolling(window=21).mean()
+GOOG['SMA50'] = GOOG['Av Price'].rolling(window=50).mean()
+GOOG['ATR'] = calc_atr(GOOG, period=atr_period)
+GOOG['Rolling Daily Vol'] = GOOG['log_ret'].rolling(window=20).std()
+GOOG['Pct Change'] = (GOOG['Close'] - GOOG['Close'].shift(1))/GOOG['Close'].shift(1)
+GOOG.dropna(subset=[('SMA21',''), ('ATR','')], inplace=True)
+
+last_price = (GOOG['Close'][-1:])
+last_vol = (GOOG['Rolling Daily Vol'][-1:].values)[0]
+
+Close = GOOG['Close', 'GOOG'].values
+print(Close[0])
+print(last_price)
+
+#Crank-Nicolson (EU Options)
+def crank_nicolson_option(
+    S0,
+    K,
+    T,
+    r,
+    sigma,
+    S_max=4.0,
+    M=200,     # asset price steps
+    N=200,     # time steps
+    option_type="call"
+):
+
+    # Grid setup
+    S_max = S_max * K
+    dS = S_max / M
+    dt = T / N
+
+    S = np.linspace(0, S_max, M + 1)
+    V = np.zeros(M + 1)
+
+    # Terminal condition (payoff)
+    if option_type == "call":
+        V = np.maximum(S - K, 0)
+    else:
+        V = np.maximum(K - S, 0)
+
+    # Coefficients
+    i = np.arange(1, M)
+    alpha = 0.25 * dt * (sigma**2 * i**2 - r * i)
+    beta  = -0.5 * dt * (sigma**2 * i**2 + r)
+    gamma = 0.25 * dt * (sigma**2 * i**2 + r * i)
+
+    # Tridiagonal matrices A and B
+    A = np.zeros((M-1, M-1))
+    B = np.zeros((M-1, M-1))
+
+    np.fill_diagonal(A, 1 - beta)
+    np.fill_diagonal(B, 1 + beta)
+
+    np.fill_diagonal(A[1:], -alpha[1:])
+    np.fill_diagonal(A[:,1:], -gamma[:-1])
+
+    np.fill_diagonal(B[1:], alpha[1:])
+    np.fill_diagonal(B[:,1:], gamma[:-1])
+
+    # Time stepping (backward)
+    for _ in range(N):
+        rhs = B @ V[1:-1]
+
+        # Boundary conditions
+        if option_type == "call":
+            rhs[-1] += gamma[-1] * (S_max - K * np.exp(-r * dt))
+        else:
+            rhs[0] += alpha[0] * (K * np.exp(-r * dt))
+
+        # Solve linear system
+        V[1:-1] = np.linalg.solve(A, rhs)
+
+    # Interpolate price at S0
+    return np.interp(S0, S, V)
+
+# Black-Scholes Pricing to Calculate Implied Vol 
+def bs_price(S, K, T, r, sigma, option_type="call"):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type == "call":
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+def bs_vega(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return S * norm.pdf(d1) * np.sqrt(T)
+
+def implied_vol(
+    market_price,
+    S,
+    K,
+    T,
+    r,
+    option_type="call",
+    tol=1e-6,
+    max_iter=100
+):
+    sigma = 0.2  # initial guess
+
+    for _ in range(max_iter):
+        price = bs_price(S, K, T, r, sigma, option_type)
+        vega = bs_vega(S, K, T, r, sigma)
+
+        diff = price - market_price
+        if abs(diff) < tol:
+            return sigma
+
+        sigma -= diff / vega
+
+    raise RuntimeError("Implied vol did not converge")
+
+# supportive code to run
+bs_call_price = bs_price(last_price.iloc[-1].item(), 360, 1, 0.03625, 0.35, "call")
+print(f"Call Price: {bs_call_price:.3f}")
+bs_vega_value = bs_vega(last_price.iloc[-1].item(), 360, 1, 0.03625, 0.35)
+print(f"Vega Value: {bs_vega_value:.3f}")
+imp_vol = implied_vol(Close[0], last_price.iloc[-1].item(), 360, 1, 0.03625, "call")
+print(f"Implied Volaitlity: {imp_vol:.3f}")
+price = crank_nicolson_option(
+    S0=last_price,
+    K=360,
+    T=1.0,
+    r=0.03625,
+    sigma=imp_vol,     #must be implied volatility
+    option_type="call"
+)
+
+price.item()
+
